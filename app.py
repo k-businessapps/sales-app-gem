@@ -342,6 +342,31 @@ def _add_totals_row(df: pd.DataFrame, money_cols: List[str]) -> pd.DataFrame:
     return pd.concat([df, pd.DataFrame([totals])], ignore_index=True)
 
 
+
+def _reorder_main_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Put the key computed metrics up front in a consistent order:
+    email, Net_Amount, Net_Amount_creditExcluded, Total_Amount, Total_Amount_creditExcluded,
+    Refund_Amount, Refund_Amount_creditExcluded, First_Subscription, First_Payment_Date, then the rest.
+    """
+    if df.empty:
+        return df
+    preferred = [
+        "email",
+        "Net_Amount",
+        "Net_Amount_creditExcluded",
+        "Total_Amount",
+        "Total_Amount_creditExcluded",
+        "Refund_Amount",
+        "Refund_Amount_creditExcluded",
+        "First_Subscription",
+        "First_Payment_Date",
+    ]
+    cols = [c for c in preferred if c in df.columns]
+    rest = [c for c in df.columns if c not in cols]
+    return df[cols + rest]
+
+
 def _write_df(ws, df: pd.DataFrame):
     for r in dataframe_to_rows(df, index=False, header=True):
         ws.append(r)
@@ -683,9 +708,12 @@ def main():
         joined_export["labels_list"] = joined_export["labels_list"].apply(lambda x: ", ".join(x) if isinstance(x, list) else "")
         joined_nonzero_export = joined_nonzero.copy()
         joined_nonzero_export["labels_list"] = joined_nonzero_export["labels_list"].apply(lambda x: ", ".join(x) if isinstance(x, list) else "")
+        joined_export = _reorder_main_columns(joined_export)
+        joined_nonzero_export = _reorder_main_columns(joined_nonzero_export)
 
         joined_export = totals_ready(joined_export)
         joined_nonzero_export = totals_ready(joined_nonzero_export)
+        email_summary = _reorder_main_columns(email_summary)
         email_summary = totals_ready(email_summary)
         owner_breakdown_incl = totals_ready(owner_breakdown_incl)
         owner_x_connected = totals_ready(owner_x_connected)
