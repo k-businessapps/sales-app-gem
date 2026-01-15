@@ -691,8 +691,22 @@ def main():
                 Refunds_NonZero_Users=("email", lambda s: s[refunds_agg.loc[s.index, refund_amount_col].fillna(0).ne(0)].nunique()),
             )
         )
-        payments_ce_daily = payments_ce.groupby("date", as_index=False).agg(Payments_Amount_creditExcluded=(amount_col, "sum"))
-        refunds_ce_daily = refunds_ce.groupby("date", as_index=False).agg(Refunds_Amount_creditExcluded=(refund_amount_col, "sum"))
+        # Ensure credit-excluded frames also have a 'date' column before grouping
+        if not payments_ce.empty and "_dt" in payments_ce.columns:
+            payments_ce["date"] = payments_ce["_dt"].dt.date
+        if not refunds_ce.empty and "_dt" in refunds_ce.columns:
+            refunds_ce["date"] = refunds_ce["_dt"].dt.date
+
+        payments_ce_daily = (
+            payments_ce.groupby("date", as_index=False).agg(Payments_Amount_creditExcluded=(amount_col, "sum"))
+            if (not payments_ce.empty and "date" in payments_ce.columns)
+            else pd.DataFrame(columns=["date", "Payments_Amount_creditExcluded"])
+        )
+        refunds_ce_daily = (
+            refunds_ce.groupby("date", as_index=False).agg(Refunds_Amount_creditExcluded=(refund_amount_col, "sum"))
+            if (not refunds_ce.empty and "date" in refunds_ce.columns)
+            else pd.DataFrame(columns=["date", "Refunds_Amount_creditExcluded"])
+        )
 
         time_breakdown = (
             payments_daily.merge(refunds_daily, on="date", how="outer")
