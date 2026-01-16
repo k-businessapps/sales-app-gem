@@ -394,6 +394,7 @@ def _build_excel(
     label_breakdown: pd.DataFrame,
     connected_breakdown: pd.DataFrame,
     time_breakdown: pd.DataFrame,
+    duplicate_email_rows: pd.DataFrame,
     flags_df: pd.DataFrame,
     fig_owner,
     fig_owner_conn,
@@ -431,6 +432,14 @@ def _build_excel(
     add_sheet("Label_Breakdown", label_breakdown)
     add_sheet("Connected_Breakdown", connected_breakdown)
     add_sheet("Time_Breakdown_Daily", time_breakdown)
+
+    if duplicate_email_rows is None or duplicate_email_rows.empty:
+        ws_dup = wb.create_sheet("Duplicate_Email_Dates")
+        ws_dup.append(["No duplicate emails across multiple dates in exports for the selected window."])
+        _apply_header_style(ws_dup)
+        _freeze(ws_dup)
+    else:
+        add_sheet("Duplicate_Email_Dates", duplicate_email_rows)
 
     if flags_df.empty:
         ws_flags = wb.create_sheet("Flags_ConvertedYes_Zero")
@@ -658,15 +667,18 @@ def main():
         label_breakdown = label_breakdown.merge(label_counts, on=["Label", "Connected_Label"], how="left").fillna({"NonZero_Users": 0})
         label_breakdown = label_breakdown[["Label", "Connected_Label", "Net_Amount", "Net_Amount_creditExcluded", "Total_Amount", "Total_Amount_creditExcluded", "Refund_Amount", "Refund_Amount_creditExcluded", "NonZero_Users"]].sort_values("Net_Amount", ascending=False)
 
-        # time breakdown (daily) from exports, excluding pipedrive via emails in email_fact_excl
+        # time breakdown (daily) based on UNIQUE emails (prevents inflation)
+        # Assign each email to its earliest activity date (payments/refunds) so totals reconcile with owner/email summaries.
         emails_scope = set(email_fact_excl["email"].dropna().unique())
+
         p_sc = payments[payments["email"].isin(emails_scope)].copy()
         r_sc = refunds[refunds["email"].isin(emails_scope)].copy()
         p_sc["date"] = p_sc["_dt"].dt.date
         r_sc["date"] = r_sc["_dt"].dt.date
 
-        payments_daily = p_sc.groupby("date", as_index=False).agg(Payments_Amount=(amount_col, "sum"))
-        refunds_daily = r_sc.groupby("date", as_index=False).agg(Refunds_Amount=(refund_amount_col, "sum"))
+        # Per-email-per-date aggregation (debug table)
+        pay_by_email_date = p_sc.groupby(["email", "date"], as_index=False).agg(Payments_Amount=(amount_col, "sum"))
+        ref_by_email_date = r_sc.groupby(["email", "date"], as_index=False).agg(Refunds_Amount=(refund_amount_col, "sum"))
 
         pce_sc = payments_ce[payments_ce["email"].isin(emails_scope)].copy()
         rce_sc = refunds_ce[refunds_ce["email"].isin(emails_scope)].copy()
@@ -675,20 +687,50 @@ def main():
         if not rce_sc.empty:
             rce_sc["date"] = rce_sc["_dt"].dt.date
 
-        payments_ce_daily = pce_sc.groupby("date", as_index=False).agg(Payments_Amount_creditExcluded=(amount_col, "sum")) if not pce_sc.empty else pd.DataFrame(columns=["date", "Payments_Amount_creditExcluded"])
-        refunds_ce_daily = rce_sc.groupby("date", as_index=False).agg(Refunds_Amount_creditExcluded=(refund_amount_col, "sum")) if not rce_sc.empty else pd.DataFrame(columns=["date", "Refunds_Amount_creditExcluded"])
-
-        time_breakdown = (
-            payments_daily.merge(refunds_daily, on="date", how="outer")
-            .merge(payments_ce_daily, on="date", how="outer")
-            .merge(refunds_ce_daily, on="date", how="outer")
-            .fillna(0)
+        pay_ce_by_email_date = (
+            pce_sc.groupby(["email", "date"], as_index=False).agg(Payments_Amount_creditExcluded=(amount_col, "sum"))
+            if not pce_sc.empty
+            else pd.DataFrame(columns=["email", "date", "Payments_Amount_creditExcluded"])
         )
-        time_breakdown["Net_Amount"] = time_breakdown["Payments_Amount"] - time_breakdown["Refunds_Amount"]
-        time_breakdown["Net_Amount_creditExcluded"] = time_breakdown["Payments_Amount_creditExcluded"] - time_breakdown["Refunds_Amount_creditExcluded"]
-        time_breakdown = time_breakdown[["date", "Net_Amount", "Net_Amount_creditExcluded", "Payments_Amount", "Payments_Amount_creditExcluded", "Refunds_Amount", "Refunds_Amount_creditExcluded"]].sort_values("date")
+        ref_ce_by_email_date = (
+            rce_sc.groupby(["email", "date"], as_index=False).agg(Refunds_Amount_creditExcluded=(refund_amount_col, "sum"))
+            if not rce_sc.empty
+            else pd.DataFrame(columns=["email", "date", "Refunds_Amount_creditExcluded"])
+        )
 
-        # flags (converted yes but total=0) from lead rows excluding pipedrive via owner at row-level
+        email_date_debug = (
+            pay_by_email_date.merge(ref_by_email_date, on=["email", "date"], how="outer")
+            .merge(pay_ce_by_email_date, on=["email", "date"], how="outer")
+            .merge(ref_ce_by_email_date, on=["email", "date"], how="outer")
+            .fillna(0.0)
+        )
+        email_date_debug["Net_Amount"] = email_date_debug["Payments_Amount"] - email_date_debug["Refunds_Amount"]
+        email_date_debug["Net_Amount_creditExcluded"] = (
+            email_date_debug["Payments_Amount_creditExcluded"] - email_date_debug["Refunds_Amount_creditExcluded"]
+        )
+        email_date_debug = email_date_debug.sort_values(["email", "date"])
+
+        # Duplicate emails across multiple dates (for debugging)
+        dup_mask = email_date_debug.groupby("email")["date"].transform("nunique").gt(1)
+        duplicate_email_rows = email_date_debug[dup_mask].copy()
+
+        # Earliest activity date per email (payments/refunds)
+        earliest_dt_pay = p_sc.groupby("email")["_dt"].min() if not p_sc.empty else pd.Series(dtype="datetime64[ns, UTC]")
+        earliest_dt_ref = r_sc.groupby("email")["_dt"].min() if not r_sc.empty else pd.Series(dtype="datetime64[ns, UTC]")
+        earliest_dt = pd.concat([earliest_dt_pay.rename("pay"), earliest_dt_ref.rename("ref")], axis=1).min(axis=1)
+        earliest_date_map = earliest_dt.dt.date.to_dict()
+
+        # One row per email: assign all windowed metrics to the earliest date (so totals match owner/email summaries)
+        time_base = email_fact_excl[["email"] + money_cols].copy()
+        time_base["date"] = time_base["email"].map(earliest_date_map)
+        time_base = time_base[time_base["date"].notna()].copy()
+
+        time_breakdown = time_base.groupby("date", as_index=False)[money_cols].sum()
+        nonzero_counts = time_base[time_base["Total_Amount"].fillna(0).ne(0)].groupby("date")["email"].nunique()
+        time_breakdown["NonZero_Users"] = time_breakdown["date"].map(nonzero_counts).fillna(0).astype(int)
+        time_breakdown = time_breakdown.sort_values("date")
+
+# flags (converted yes but total=0) from lead rows excluding pipedrive via owner at row-level
         flags_df = pd.DataFrame()
         if "Person - Converted" in joined.columns:
             m_yes = joined["Person - Converted"].astype(str).str.strip().str.lower().eq("yes")
@@ -777,6 +819,7 @@ def main():
             label_breakdown=label_breakdown,
             connected_breakdown=connected_breakdown,
             time_breakdown=time_breakdown,
+            duplicate_email_rows=duplicate_email_rows,
             flags_df=flags_df,
             fig_owner=fig_owner,
             fig_owner_conn=fig_owner_conn,
@@ -822,6 +865,12 @@ def main():
         st.markdown("#### Daily breakdown (excluded owner removed)")
         st.dataframe(time_breakdown, use_container_width=True)
         st.pyplot(fig_time, use_container_width=True)
+
+        if duplicate_email_rows is not None and not duplicate_email_rows.empty:
+            st.markdown("#### Duplicate emails across multiple dates (debug)")
+            st.dataframe(duplicate_email_rows, use_container_width=True)
+        else:
+            st.caption("No duplicate emails across multiple dates in exports for this window.")
 
     with tab_export:
         st.download_button(
