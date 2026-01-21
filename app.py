@@ -51,8 +51,7 @@ def _split_emails(cell: object) -> List[str]:
     s = str(cell).strip()
     if not s:
         return []
-    parts = re.split(r"[,
-;|\s]+", s)
+    parts = re.split(r"[,\n;|\s]+", s)
     out = []
     for p in parts:
         e = _normalize_email(p)
