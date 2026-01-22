@@ -62,6 +62,7 @@ def _inject_brand_css():
 
 
 def _logo_html(width_px: int = 220, top_pad_px: int = 10) -> str:
+    # Adjust path if needed, or remove if no image
     logo_path = Path(__file__).parent / "assets" / "KrispCallLogo.png"
     if not logo_path.exists():
         return ""
@@ -110,7 +111,7 @@ def _mixpanel_headers() -> Dict[str, str]:
 # Core utilities
 # =========================
 def _excel_safe(v):
-    """Convert values to Excel-safe primitives. Avoid openpyxl ValueError."""
+    """Convert values to Excel-safe primitives."""
     if v is None or v is pd.NA:
         return ""
     if isinstance(v, float) and (np.isnan(v) or np.isinf(v)):
@@ -161,7 +162,6 @@ def _extract_emails(value) -> List[str]:
 
 
 def _pick_first_existing_column(df: pd.DataFrame, candidates: List[str]) -> Optional[str]:
-    """Case-insensitive lookup first, then exact."""
     lower_map = {c.lower(): c for c in df.columns}
     for c in candidates:
         if c.lower() in lower_map:
@@ -182,7 +182,7 @@ def _parse_time_to_dt(series: pd.Series) -> pd.Series:
 
 
 # =========================
-# Mixpanel export + DEDUPE (your logic)
+# Mixpanel export + DEDUPE
 # =========================
 def dedupe_mixpanel_export(df: pd.DataFrame) -> pd.DataFrame:
     required = ["event", "distinct_id", "time", "$insert_id"]
@@ -191,7 +191,6 @@ def dedupe_mixpanel_export(df: pd.DataFrame) -> pd.DataFrame:
         raise KeyError(f"Missing columns: {missing}. Available: {list(df.columns)}")
 
     df = df.copy()
-
     t = pd.to_numeric(df["time"], errors="coerce")
     if t.notna().all():
         if float(t.median()) > 1e11:
@@ -206,12 +205,8 @@ def dedupe_mixpanel_export(df: pd.DataFrame) -> pd.DataFrame:
         sort_cols = ["mp_processing_time_ms"] + sort_cols
 
     df = df.sort_values(sort_cols, kind="mergesort")
-
     before = len(df)
-    df = df.drop_duplicates(
-        subset=["event", "distinct_id", "_time_s", "$insert_id"],
-        keep="last",
-    )
+    df = df.drop_duplicates(subset=["event", "distinct_id", "_time_s", "$insert_id"], keep="last")
     after = len(df)
 
     df = df.drop(columns=["_time_s"])
@@ -223,11 +218,6 @@ def dedupe_mixpanel_export(df: pd.DataFrame) -> pd.DataFrame:
 
 @st.cache_data(show_spinner=False, ttl=600)
 def fetch_mixpanel_event_export(project_id: int, base_url: str, from_date: date, to_date: date, event_name: str) -> pd.DataFrame:
-    """
-    Fetches Mixpanel Export API and returns a flattened dataframe with:
-    - top-level fields (event, distinct_id, time, etc.)
-    - properties flattened into columns
-    """
     url = f"{base_url.rstrip('/')}/api/2.0/export"
     params = {
         "project_id": int(project_id),
@@ -258,14 +248,13 @@ def fetch_mixpanel_event_export(project_id: int, base_url: str, from_date: date,
         props = pd.json_normalize(raw["properties"])
         raw = pd.concat([raw.drop(columns=["properties"]), props], axis=1)
 
-    # dt
     if "time" in raw.columns and not raw.empty:
         raw["_dt"] = _parse_time_to_dt(raw["time"])
     return raw
 
 
 # =========================
-# Leads parsing (emails, labels, connected, created date)
+# Leads parsing
 # =========================
 def _split_labels(value) -> List[str]:
     if value is None:
@@ -289,11 +278,6 @@ def _connected_from_labels(labels: List[str]) -> bool:
 
 
 def _expand_leads_for_multiple_emails(df: pd.DataFrame, email_cols_priority: List[str]) -> Tuple[pd.DataFrame, List[int]]:
-    """
-    Resolve emails from first non-empty email column (priority order).
-    If that cell contains multiple emails, duplicate row for each email.
-    Keeps rows with missing email (email=None). Returns those row numbers for logs.
-    """
     missing_rows: List[int] = []
     expanded = []
 
@@ -305,15 +289,12 @@ def _expand_leads_for_multiple_emails(df: pd.DataFrame, email_cols_priority: Lis
                 if found:
                     emails = found
                     break
-
         if not emails:
             rec = row.to_dict()
             rec["email"] = None
             expanded.append(rec)
-            # Excel-style row numbering (header = row 1)
             missing_rows.append(i + 2)
             continue
-
         for e in emails:
             rec = row.to_dict()
             rec["email"] = e
@@ -326,7 +307,6 @@ def _expand_leads_for_multiple_emails(df: pd.DataFrame, email_cols_priority: Lis
 # Business logic
 # =========================
 def _filter_credit_excluded(df: pd.DataFrame, text_col: Optional[str]) -> pd.DataFrame:
-    """Remove credit-related rows by exact (case-insensitive) match on the provided text column."""
     if df.empty or not text_col or text_col not in df.columns:
         return df.copy()
     mask = df[text_col].apply(_norm_text).isin(CREDIT_EXCLUDE_DESCS)
@@ -344,83 +324,102 @@ def _windowed_email_summary(
     days: int = 7,
 ) -> pd.DataFrame:
     """
-    7-day window per email, start defined on GROSS payments:
-    - earliest 'Workspace Subscription' (contains) if present, else first payment event
-    Window applied to: gross payments, gross refunds, credit-excluded payments, credit-excluded refunds.
+    7-day window logic per email (Legacy logic).
     """
     d = payments_gross.dropna(subset=["email"]).copy()
     if d.empty:
         cols = [
-            "email",
-            "Net_Amount",
-            "Net_Amount_creditExcluded",
-            "Total_Amount",
-            "Total_Amount_creditExcluded",
-            "Refund_Amount",
-            "Refund_Amount_creditExcluded",
-            "Transactions",
-            "Transactions_creditExcluded",
-            "First_Subscription",
-            "First_Payment_Date",
+            "email", "Net_Amount", "Net_Amount_creditExcluded", "Total_Amount",
+            "Total_Amount_creditExcluded", "Refund_Amount", "Refund_Amount_creditExcluded",
+            "Transactions", "Transactions_creditExcluded", "First_Subscription", "First_Payment_Date"
         ]
         return pd.DataFrame(columns=cols)
 
     d[amount_col] = pd.to_numeric(d[amount_col], errors="coerce").fillna(0.0)
     d = d.sort_values("_dt", kind="mergesort")
 
-    ce_map = {e: g.sort_values("_dt", kind="mergesort") for e, g in payments_ce.dropna(subset=["email"]).groupby("email", sort=False)} if not payments_ce.empty else {}
-    ref_map = {e: g.sort_values("_dt", kind="mergesort") for e, g in refunds_gross.dropna(subset=["email"]).groupby("email", sort=False)} if not refunds_gross.empty else {}
-    ref_ce_map = {e: g.sort_values("_dt", kind="mergesort") for e, g in refunds_ce.dropna(subset=["email"]).groupby("email", sort=False)} if not refunds_ce.empty else {}
+    # Pre-group helpers
+    ce_map = {e: g.sort_values("_dt") for e, g in payments_ce.dropna(subset=["email"]).groupby("email")} if not payments_ce.empty else {}
+    ref_map = {e: g.sort_values("_dt") for e, g in refunds_gross.dropna(subset=["email"]).groupby("email")} if not refunds_gross.empty else {}
+    ref_ce_map = {e: g.sort_values("_dt") for e, g in refunds_ce.dropna(subset=["email"]).groupby("email")} if not refunds_ce.empty else {}
 
     out = []
     for email, g in d.groupby("email", sort=False):
-        g = g.sort_values("_dt", kind="mergesort")
-
+        g = g.sort_values("_dt")
         trigger = False
         start = None
-
         if desc_col and desc_col in g.columns:
             mask = g[desc_col].astype(str).str.contains("Workspace Subscription", case=False, na=False)
             if mask.any():
                 trigger = True
                 start = g.loc[mask, "_dt"].min()
-
         if start is None:
             start = g["_dt"].min()
 
         end = start + timedelta(days=days)
 
+        # 7-day Sums
         gross_total = float(g[(g["_dt"] >= start) & (g["_dt"] <= end)][amount_col].sum())
+        gross_txn = int(g[(g["_dt"] >= start) & (g["_dt"] <= end)].shape[0])
 
         g_ce = ce_map.get(email)
         ce_total = float(g_ce[(g_ce["_dt"] >= start) & (g_ce["_dt"] <= end)][amount_col].sum()) if g_ce is not None else 0.0
-
-
-        gross_txn = int(g[(g["_dt"] >= start) & (g["_dt"] <= end)].shape[0])
         ce_txn = int(g_ce[(g_ce["_dt"] >= start) & (g_ce["_dt"] <= end)].shape[0]) if g_ce is not None else 0
+
         g_ref = ref_map.get(email)
         ref_total = float(g_ref[(g_ref["_dt"] >= start) & (g_ref["_dt"] <= end)][refund_amount_col].sum()) if g_ref is not None else 0.0
 
         g_ref_ce = ref_ce_map.get(email)
         ref_ce_total = float(g_ref_ce[(g_ref_ce["_dt"] >= start) & (g_ref_ce["_dt"] <= end)][refund_amount_col].sum()) if g_ref_ce is not None else 0.0
 
-        out.append(
-            {
-                "email": email,
-                "Net_Amount": gross_total - ref_total,
-                "Net_Amount_creditExcluded": ce_total - ref_ce_total,
-                "Total_Amount": gross_total,
-                "Total_Amount_creditExcluded": ce_total,
-                "Refund_Amount": ref_total,
-                "Refund_Amount_creditExcluded": ref_ce_total,
-                "Transactions": gross_txn,
-                "Transactions_creditExcluded": ce_txn,
-                "First_Subscription": "TRUE" if trigger else "FALSE",
-                "First_Payment_Date": pd.to_datetime(start, utc=True).tz_convert(None) if pd.notna(start) else None,
-            }
-        )
-
+        out.append({
+            "email": email,
+            "Net_Amount": gross_total - ref_total,
+            "Net_Amount_creditExcluded": ce_total - ref_ce_total,
+            "Total_Amount": gross_total,
+            "Total_Amount_creditExcluded": ce_total,
+            "Refund_Amount": ref_total,
+            "Refund_Amount_creditExcluded": ref_ce_total,
+            "Transactions": gross_txn,
+            "Transactions_creditExcluded": ce_txn,
+            "First_Subscription": "TRUE" if trigger else "FALSE",
+            "First_Payment_Date": pd.to_datetime(start, utc=True).tz_convert(None) if pd.notna(start) else None,
+        })
     return pd.DataFrame(out)
+
+
+def _strict_range_email_summary(
+    payments_gross: pd.DataFrame,
+    refunds_gross: pd.DataFrame,
+    payments_ce: pd.DataFrame,
+    refunds_ce: pd.DataFrame,
+    amount_col: str,
+    refund_amount_col: str,
+) -> pd.DataFrame:
+    """
+    Strict selected range summation (Period Revenue) per email.
+    Assumes inputs are already filtered to the selected date range.
+    """
+    # Helper to group and sum
+    def get_sums(df, group_col, sum_col, out_col):
+        if df.empty:
+            return pd.Series(dtype=float)
+        return df.groupby(group_col)[sum_col].sum().rename(out_col)
+
+    p_gross = get_sums(payments_gross, "email", amount_col, "Period_Total_Amount")
+    p_ce = get_sums(payments_ce, "email", amount_col, "Period_Total_Amount_creditExcluded")
+    r_gross = get_sums(refunds_gross, "email", refund_amount_col, "Period_Refund_Amount")
+    r_ce = get_sums(refunds_ce, "email", refund_amount_col, "Period_Refund_Amount_creditExcluded")
+
+    # Combine
+    df = pd.concat([p_gross, p_ce, r_gross, r_ce], axis=1).fillna(0.0)
+    df.index.name = "email"
+    df = df.reset_index()
+
+    df["Period_Net_Amount"] = df["Period_Total_Amount"] - df["Period_Refund_Amount"]
+    df["Period_Net_Amount_creditExcluded"] = df["Period_Total_Amount_creditExcluded"] - df["Period_Refund_Amount_creditExcluded"]
+
+    return df
 
 
 def _add_totals_row(df: pd.DataFrame, label_col: Optional[str] = None) -> pd.DataFrame:
@@ -438,42 +437,30 @@ def _add_totals_row(df: pd.DataFrame, label_col: Optional[str] = None) -> pd.Dat
     return pd.concat([out, pd.DataFrame([row])], ignore_index=True)
 
 
-
 def _style_totals_row(df: pd.DataFrame):
     if df is None or df.empty:
         return df
-
     def _row_style(row):
         is_total = str(row.iloc[0]).strip().upper() == "TOTAL"
         return ["font-weight: bold" if is_total else "" for _ in row]
-
     return df.style.apply(_row_style, axis=1)
 
 
-
 def _style_sheet(ws):
-    # Header
     for cell in ws[1]:
         cell.font = Font(bold=True)
         cell.alignment = Alignment(horizontal="center", vertical="center")
     ws.freeze_panes = "A2"
-
-    # Bold TOTAL rows (summations)
     for row in ws.iter_rows(min_row=2, max_row=ws.max_row):
         first = row[0].value
-        if first is None:
-            continue
-        if str(first).strip().upper() == "TOTAL":
+        if first and str(first).strip().upper() == "TOTAL":
             for cell in row:
                 cell.font = Font(bold=True)
-
-    # Best-effort column widths
     for col in ws.columns:
         letter = col[0].column_letter
         max_len = 0
         for cell in col[:250]:
-            if cell.value is None:
-                continue
+            if cell.value is None: continue
             max_len = max(max_len, len(str(cell.value)))
         ws.column_dimensions[letter].width = min(max(10, max_len + 2), 50)
 
@@ -489,6 +476,7 @@ def _build_excel(
     time_summary: pd.DataFrame,
     duplicate_leads: pd.DataFrame,
     self_converted_emails: pd.DataFrame,
+    overall_metrics_df: pd.DataFrame,  # New
     logs_df: pd.DataFrame,
     fig_owner,
     fig_owner_conn,
@@ -510,14 +498,15 @@ def _build_excel(
         _style_sheet(ws)
         return ws
 
-    # Main sheet
     ws0 = wb.active
-    ws0.title = "Leads_with_Payments"
-    main_df = _add_totals_row(leads_with_payments, label_col=None)
-    for r in dataframe_to_rows(main_df, index=False, header=True):
-        ws0.append([_excel_safe(x) for x in r])
+    ws0.title = "Overall Metrics"
+    # Overall metrics doesn't need totals row, it is a key-value table
+    if not overall_metrics_df.empty:
+        for r in dataframe_to_rows(overall_metrics_df, index=False, header=True):
+            ws0.append([_excel_safe(x) for x in r])
     _style_sheet(ws0)
 
+    add_sheet("Leads_with_Payments", leads_with_payments, label_col=None)
     add_sheet("Leads_Payments_NonZero", leads_nonzero, label_col=None)
     add_sheet("Email_Summary", email_summary, label_col="email")
     ws_owner = add_sheet("Owner_Summary", owner_summary, label_col=owner_summary.columns[0] if not owner_summary.empty else None, add_totals=False)
@@ -531,7 +520,6 @@ def _build_excel(
 
     # Charts sheet
     ws_chart = wb.create_sheet("Charts")
-
     def add_fig(ws, fig, anchor, table_df: pd.DataFrame, table_anchor_col: int, table_anchor_row: int):
         img_bytes = BytesIO()
         fig.savefig(img_bytes, format="png", dpi=150, bbox_inches="tight")
@@ -539,7 +527,6 @@ def _build_excel(
         img = XLImage(img_bytes)
         img.anchor = anchor
         ws.add_image(img)
-
         if table_df is not None and not table_df.empty:
             rounded = table_df.copy()
             for c in rounded.select_dtypes(include=[np.number]).columns:
@@ -553,13 +540,9 @@ def _build_excel(
     add_fig(ws_chart, fig_time, "A51", time_summary, 8, 51)
     _style_sheet(ws_chart)
 
-    # Remove default "Sheet" if present
-    if "Sheet" in wb.sheetnames:
-        del wb["Sheet"]
-
+    if "Sheet" in wb.sheetnames: del wb["Sheet"]
     out = BytesIO()
     wb.save(out)
-
     fname = f"payment_summary_{from_date.strftime('%b%d').lower()}_{to_date.strftime('%b%d').lower()}.xlsx"
     return fname, out.getvalue()
 
@@ -572,7 +555,6 @@ def main():
     require_login()
     _inject_brand_css()
 
-    # Header
     st.markdown('<div style="height:10px;"></div>', unsafe_allow_html=True)
     l, r = st.columns([1, 3], vertical_alignment="center")
     with l:
@@ -583,26 +565,21 @@ def main():
             unsafe_allow_html=True,
         )
 
-    # Sidebar
     with st.sidebar:
         st.markdown("### Date Selection")
         today = date.today()
         first_of_month = today.replace(day=1)
-
-        # Default: 4 days before first of current month (Jan -> Dec 28)
         default_start = first_of_month - timedelta(days=4)
         default_end = today - timedelta(days=1)
-
         from_date = st.date_input("Date from", value=default_start)
         to_date = st.date_input("Date to", value=default_end)
-
         st.markdown("---")
         st.markdown("### Rules")
         st.info("Summaries exclude owner: Pipedrive KrispCall. Main tables still include it.")
         st.info("Time summary groups by Lead - Lead created on date (after summaries dedupe).")
         st.info("7-day window per email based on earliest Workspace Subscription payment if present. Else first payment event.")
+        st.info("Overall Metrics Tab includes both 7-day and strict period metrics.")
 
-    # Inputs
     st.markdown('<div class="kc-card">', unsafe_allow_html=True)
     leads_file = st.file_uploader("Upload Leads CSV", type=["csv"])
     run = st.button("Run Analysis", type="primary", disabled=(leads_file is None))
@@ -616,19 +593,16 @@ def main():
     with st.spinner("Running analysis..."):
         leads_raw = pd.read_csv(leads_file)
 
-        # Owner + created + labels
+        # Columns
         owner_col = _pick_first_existing_column(leads_raw, ["Lead - Owner", "Deal - Owner", "Owner", "owner"]) or "Owner"
         created_col = _pick_first_existing_column(leads_raw, ["Lead - Lead created on", "Lead created on", "Created on"])
         label_col = _pick_first_existing_column(leads_raw, ["Lead - Label", "Label", "Labels", "Lead - Labels"])
-
-        # Email columns priority for THIS workflow
+        
         email_cols_priority: List[str] = []
         for cand in ["Person - Email", "Lead - User Email"]:
             col = _pick_first_existing_column(leads_raw, [cand])
             if col and col not in email_cols_priority:
                 email_cols_priority.append(col)
-
-        # Fallback: if those columns are missing, fall back to any column containing "email"
         if not email_cols_priority:
             fallback = [c for c in leads_raw.columns if "email" in c.lower()]
             email_cols_priority = fallback[:5]
@@ -637,389 +611,288 @@ def main():
         if missing_rows:
             logs.append(f"Missing email for {len(missing_rows)} lead row(s). Example rows: {missing_rows[:20]}")
 
-        # labels_list + Connected
         if label_col and label_col in expanded_leads.columns:
             expanded_leads["labels_list"] = expanded_leads[label_col].apply(_split_labels)
         else:
             expanded_leads["labels_list"] = [[] for _ in range(len(expanded_leads))]
-
         expanded_leads["Connected"] = expanded_leads["labels_list"].apply(_connected_from_labels)
 
-        # lead created dt
         if created_col and created_col in expanded_leads.columns:
             expanded_leads["_lead_created_dt"] = pd.to_datetime(expanded_leads[created_col], errors="coerce")
         else:
             expanded_leads["_lead_created_dt"] = pd.NaT
 
-        # Mixpanel exports
+        # Mixpanel
         pid = int(_get_secret(["mixpanel", "project_id"]))
         base = _get_secret(["mixpanel", "base_url"], "https://data-eu.mixpanel.com")
 
-        # Payments always on selected window
+        # Fetch PAYMENTS & REFUNDS (Strict Range)
         payments_raw = fetch_mixpanel_event_export(pid, base, from_date, to_date, "New Payment Made")
+        # STRICT Refund range as requested (previously 60 days)
+        refunds_raw = fetch_mixpanel_event_export(pid, base, from_date, to_date, "Refund Granted")
 
-        # Refund window rule: if selected window < 2 months, export last 2 months
-        window_days = (to_date - from_date).days
-        refund_from = (to_date - timedelta(days=60)) if window_days < 60 else from_date
-        refunds_raw = fetch_mixpanel_event_export(pid, base, refund_from, to_date, "Refund Granted")
-
-        # Dedupe (your logic)
         if not payments_raw.empty:
             payments = dedupe_mixpanel_export(payments_raw)
-            logs.append(
-                f"Payments raw rows: {payments.attrs.get('dedupe_before', len(payments_raw))}. Dedupe removed: {payments.attrs.get('dedupe_removed', 0)}."
-            )
+            logs.append(f"Payments raw rows: {payments.attrs.get('dedupe_before', len(payments_raw))}. Dedupe removed: {payments.attrs.get('dedupe_removed', 0)}.")
         else:
             payments = payments_raw.copy()
             logs.append("Payments raw rows: 0.")
 
         if not refunds_raw.empty:
             refunds = dedupe_mixpanel_export(refunds_raw)
-            logs.append(
-                f"Refunds raw rows: {refunds.attrs.get('dedupe_before', len(refunds_raw))}. Dedupe removed: {refunds.attrs.get('dedupe_removed', 0)}."
-            )
+            logs.append(f"Refunds raw rows: {refunds.attrs.get('dedupe_before', len(refunds_raw))}. Dedupe removed: {refunds.attrs.get('dedupe_removed', 0)}.")
         else:
             refunds = refunds_raw.copy()
             logs.append("Refunds raw rows: 0.")
 
-        # Identify email columns in exports (case-insensitive)
+        # Parsing
         pay_email_col = _pick_first_existing_column(payments, ["$email", "email", "Email", "EMAIL", "User Email", "user.email"])
         ref_email_col = _pick_first_existing_column(refunds, ["User Email", "user.email", "$email", "email", "Email", "EMAIL"])
-
+        
         payments["email"] = payments[pay_email_col].apply(lambda v: (_extract_emails(v)[0] if _extract_emails(v) else None)) if pay_email_col and pay_email_col in payments.columns else None
         refunds["email"] = refunds[ref_email_col].apply(lambda v: (_extract_emails(v)[0] if _extract_emails(v) else None)) if ref_email_col and ref_email_col in refunds.columns else None
 
-        # Amount + description columns
         amount_col = _pick_first_existing_column(payments, ["Amount", "amount", "Amount Paid"])
         desc_col = _pick_first_existing_column(payments, ["Amount Description", "description", "Plan"])
-
         refund_amount_col = _pick_first_existing_column(refunds, ["Refund Amount", "refund_amount", "Amount", "amount"])
         refund_desc_col = _pick_first_existing_column(refunds, ["Refunded Transaction description", "Refunded Transaction Description", "Refunded Transaction"])
 
-        if not amount_col:
-            raise RuntimeError("Could not find payment amount column in Mixpanel export (expected 'Amount').")
+        if not amount_col: raise RuntimeError("Could not find payment amount column.")
         if not refund_amount_col:
             refunds["Refund Amount"] = 0.0
             refund_amount_col = "Refund Amount"
 
-        # Numeric safety
         payments[amount_col] = pd.to_numeric(payments[amount_col], errors="coerce").fillna(0.0)
         refunds[refund_amount_col] = pd.to_numeric(refunds[refund_amount_col], errors="coerce").fillna(0.0)
 
+        # Full datasets filtered by Credit Exclusions
+        payments_all_ce = _filter_credit_excluded(payments, desc_col)
+        refunds_all_ce = _filter_credit_excluded(refunds, refund_desc_col)
 
-        # Leads emails list from the uploaded export
+        # ---------------------------
+        # Overall Global Metrics (Strict Range, No Lead Join)
+        # ---------------------------
+        # Overall Revenue: (Sum Payments) - (Sum Refunds) in selected window
+        overall_rev_sum = payments[amount_col].sum()
+        overall_ref_sum = refunds[refund_amount_col].sum()
+        metric_overall_revenue = float(overall_rev_sum - overall_ref_sum)
+
+        # Overall Conversions: Unique emails with Workspace Subscription
+        sub_mask = pd.Series(False, index=payments.index)
+        if desc_col and desc_col in payments.columns:
+            sub_mask = payments[desc_col].astype(str).str.contains("Workspace Subscription", case=False, na=False)
+        metric_overall_conversions = int(payments.loc[sub_mask, "email"].dropna().nunique())
+
+        # ---------------------------
+        # Email Summaries (Joined)
+        # ---------------------------
         lead_emails = set(expanded_leads["email"].dropna().unique())
+        
+        # Subsets for 7-day window logic (only emails in leads)
+        payments_leads = payments[payments["email"].isin(lead_emails)].copy()
+        refunds_leads = refunds[refunds["email"].isin(lead_emails)].copy()
+        payments_leads_ce = payments_all_ce[payments_all_ce["email"].isin(lead_emails)].copy()
+        refunds_leads_ce = refunds_all_ce[refunds_all_ce["email"].isin(lead_emails)].copy()
 
-        # Keep full Mixpanel pulls for overall metrics and self-converted detection
-        payments_all = payments.copy()
-        refunds_all = refunds.copy()
-
-        # Credit excluded variants (full)
-        payments_all_ce = _filter_credit_excluded(payments_all, desc_col)
-        refunds_all_ce = _filter_credit_excluded(refunds_all, refund_desc_col)
-
-        # Overall metrics (selected date range only)
-        overall_revenue = float(pd.to_numeric(payments_all[amount_col], errors="coerce").fillna(0).sum())
-        overall_revenue_ce = float(pd.to_numeric(payments_all_ce[amount_col], errors="coerce").fillna(0).sum()) if not payments_all_ce.empty else 0.0
-        overall_transactions = int(len(payments_all))
-        overall_transactions_ce = int(len(payments_all_ce)) if not payments_all_ce.empty else 0
-
-        # Overall refunds should only count events inside selected date range (even if refunds were fetched for a longer window)
-        if "_dt" in refunds_all.columns and not refunds_all.empty:
-            _ref_in_range = refunds_all["_dt"].dt.date.between(from_date, to_date)
-            overall_refunds = float(pd.to_numeric(refunds_all.loc[_ref_in_range, refund_amount_col], errors="coerce").fillna(0).sum())
-        else:
-            overall_refunds = 0.0
-
-        if "_dt" in refunds_all_ce.columns and not refunds_all_ce.empty:
-            _ref_in_range_ce = refunds_all_ce["_dt"].dt.date.between(from_date, to_date)
-            overall_refunds_ce = float(pd.to_numeric(refunds_all_ce.loc[_ref_in_range_ce, refund_amount_col], errors="coerce").fillna(0).sum())
-        else:
-            overall_refunds_ce = 0.0
-
-        # Leads-only subsets for join tables and summary base
-        payments = payments_all[payments_all["email"].isin(lead_emails)].copy()
-        refunds = refunds_all[refunds_all["email"].isin(lead_emails)].copy()
-
-        payments_ce = payments_all_ce[payments_all_ce["email"].isin(lead_emails)].copy() if not payments_all_ce.empty else payments_all_ce.copy()
-        refunds_ce = refunds_all_ce[refunds_all_ce["email"].isin(lead_emails)].copy() if not refunds_all_ce.empty else refunds_all_ce.copy()
-
-        # Windowed per-email summary (Net first columns)
-        email_summary = _windowed_email_summary(
-            payments_gross=payments,
-            refunds_gross=refunds,
-            payments_ce=payments_ce,
-            refunds_ce=refunds_ce,
-            amount_col=amount_col,
-            desc_col=desc_col,
-            refund_amount_col=refund_amount_col,
-            days=7,
+        # 1. 7-Day Window Summary
+        email_summary_7d = _windowed_email_summary(
+            payments_gross=payments_leads, refunds_gross=refunds_leads,
+            payments_ce=payments_leads_ce, refunds_ce=refunds_leads_ce,
+            amount_col=amount_col, desc_col=desc_col, refund_amount_col=refund_amount_col, days=7
         )
 
-        # Join back to leads (preserve all rows)
-        joined = expanded_leads.merge(email_summary, on="email", how="left")
-        metric_cols = [
-            "Net_Amount",
-            "Net_Amount_creditExcluded",
-            "Total_Amount",
-            "Total_Amount_creditExcluded",
-            "Refund_Amount",
-            "Refund_Amount_creditExcluded",
-            "Transactions",
-            "Transactions_creditExcluded",
-        ]
-        for c in metric_cols:
+        # 2. Strict Range Period Summary
+        # We compute this for ALL emails in payments to catch self-converted too
+        email_summary_period = _strict_range_email_summary(
+            payments_gross=payments, refunds_gross=refunds,
+            payments_ce=payments_all_ce, refunds_ce=refunds_all_ce,
+            amount_col=amount_col, refund_amount_col=refund_amount_col
+        )
+
+        # Join everything to Leads
+        joined = expanded_leads.merge(email_summary_7d, on="email", how="left")
+        joined = joined.merge(email_summary_period, on="email", how="left")
+
+        # Fill NaNs
+        numeric_cols_7d = ["Net_Amount", "Net_Amount_creditExcluded", "Total_Amount", "Total_Amount_creditExcluded", "Refund_Amount", "Refund_Amount_creditExcluded"]
+        numeric_cols_period = ["Period_Net_Amount", "Period_Net_Amount_creditExcluded", "Period_Total_Amount", "Period_Total_Amount_creditExcluded", "Period_Refund_Amount", "Period_Refund_Amount_creditExcluded"]
+        for c in numeric_cols_7d + numeric_cols_period:
             joined[c] = pd.to_numeric(joined[c], errors="coerce").fillna(0.0)
-        joined["First_Subscription"] = joined.get("First_Subscription", "FALSE").fillna("FALSE")
 
         # Non-zero table
-        joined_nonzero = joined[joined["Total_Amount"].fillna(0).ne(0)].copy()
+        joined_nonzero = joined[joined["Total_Amount"].fillna(0).ne(0) | joined["Period_Total_Amount"].fillna(0).ne(0)].copy()
 
-        # =========================
-        # Summaries base:
-        # - Exclude owner Pipedrive KrispCall from ALL summaries
-        # - If duplicates remain (by email), keep earliest Lead created on
-        # - Time summary grouped by Lead created on date (not payment date)
-        # =========================
-        owner_series = joined[owner_col].astype(str).str.strip().str.lower()
-        summ_base = joined[~owner_series.eq(EXCLUDED_OWNER_CANON)].copy()
+        # ---------------------------
+        # Base Sets for Overall Metrics Tab
+        # ---------------------------
+        # 1. Self Converted: Subscription Payers NOT in Lead Emails
+        subscription_emails = set(payments.loc[sub_mask, "email"].dropna().unique())
+        self_converted_emails = sorted(list(subscription_emails - lead_emails))
+        
+        # 2. Sales Attempted: Emails in Leads List excluding Pipedrive KrispCall
+        # Note: We need to dedupe leads first to get unique emails for the count
+        # Filter leads first
+        sales_leads_base = expanded_leads[~expanded_leads[owner_col].astype(str).str.strip().str.lower().eq(EXCLUDED_OWNER_CANON)].copy()
+        sales_attempted_emails = set(sales_leads_base["email"].dropna().unique())
 
+        # 3. Sales Effort: Sales Attempted AND Connected == True
+        sales_effort_base = sales_leads_base[sales_leads_base["Connected"] == True]
+        sales_effort_emails = set(sales_effort_base["email"].dropna().unique())
+
+        # Helpers to calc sums for lists of emails
+        def calc_segment_metrics(emails_list: list):
+            # Period (Strict)
+            p_pay = payments[payments["email"].isin(emails_list)]
+            p_ref = refunds[refunds["email"].isin(emails_list)]
+            period_net = p_pay[amount_col].sum() - p_ref[refund_amount_col].sum()
+
+            # 7-Day (Must recalc window logic for these emails specifically or pull from join?)
+            # Pulling from join is safer if they are in leads. But Self Converted are NOT in leads.
+            # So we must run window logic on them.
+            
+            p_pay_ce = payments_all_ce[payments_all_ce["email"].isin(emails_list)]
+            p_ref_ce = refunds_all_ce[refunds_all_ce["email"].isin(emails_list)]
+            
+            summ = _windowed_email_summary(
+                payments_gross=p_pay, refunds_gross=p_ref,
+                payments_ce=p_pay_ce, refunds_ce=p_ref_ce,
+                amount_col=amount_col, desc_col=desc_col, refund_amount_col=refund_amount_col, days=7
+            )
+            net_7d = summ["Net_Amount"].sum() if not summ.empty else 0.0
+            
+            return period_net, net_7d, len(emails_list)
+
+        sc_period_net, sc_7d_net, sc_count = calc_segment_metrics(list(self_converted_emails))
+        sa_period_net, sa_7d_net, sa_count = calc_segment_metrics(list(sales_attempted_emails))
+        se_period_net, se_7d_net, se_count = calc_segment_metrics(list(sales_effort_emails))
+
+        overall_metrics_data = [
+            {"Metric": "Overall Revenue (Period)", "Value": metric_overall_revenue, "Description": "Total Revenue - Refunds in selected range (No filters)"},
+            {"Metric": "Overall Conversions", "Value": metric_overall_conversions, "Description": "Unique emails with Workspace Subscription payment"},
+            {"Metric": "Self Converted Net Total (Period)", "Value": sc_period_net, "Description": "Revenue from Self Converted (Not in Leads) in range"},
+            {"Metric": "Sales Attempted Total (Period)", "Value": sa_period_net, "Description": "Revenue from Leads (Excl Pipedrive KC) in range"},
+            {"Metric": "Sales Effort Total (Period)", "Value": se_period_net, "Description": "Revenue from Connected Leads (Excl Pipedrive KC) in range"},
+            {"Metric": "Self Converted (7 day)", "Value": sc_7d_net, "Description": "7-day window revenue for Self Converted"},
+            {"Metric": "Sales Attempted (7 day)", "Value": sa_7d_net, "Description": "7-day window revenue for Sales Attempted"},
+            {"Metric": "Sales Effort Total (7 day)", "Value": se_7d_net, "Description": "7-day window revenue for Sales Effort"},
+            {"Metric": "Self Converted Conversions", "Value": sc_count, "Description": "Count of unique Self Converted emails"},
+            {"Metric": "Sales Attempted Users", "Value": sa_count, "Description": "Count of unique Sales Attempted emails"},
+            {"Metric": "Sales Effort Users", "Value": se_count, "Description": "Count of unique Sales Effort emails"},
+        ]
+        overall_metrics_df = pd.DataFrame(overall_metrics_data)
+
+        # ---------------------------
+        # Summaries for Tables
+        # ---------------------------
+        # Base for summaries: Joined DF excluding Owner
+        summ_base = joined[~joined[owner_col].astype(str).str.strip().str.lower().eq(EXCLUDED_OWNER_CANON)].copy()
         summ_base["_lead_created_dt"] = pd.to_datetime(summ_base["_lead_created_dt"], errors="coerce")
 
+        # Dedupe by email (keep first by create date)
         dup_mask = summ_base["email"].notna() & summ_base["email"].duplicated(keep=False)
         duplicate_leads = summ_base.loc[dup_mask].sort_values(["email", "_lead_created_dt"], kind="mergesort").copy()
+        
+        summ_dedup = summ_base.sort_values(["email", "_lead_created_dt"], kind="mergesort").drop_duplicates(subset=["email"], keep="first").copy()
 
-        summ_dedup = (
-            summ_base.sort_values(["email", "_lead_created_dt"], kind="mergesort")
-            .drop_duplicates(subset=["email"], keep="first")
-            .copy()
-        )
-
-        logs.append(f"Summary dedupe kept 1 row per email after excluding '{EXCLUDED_OWNER_CANON}'.")
-        logs.append(f"Duplicate leads (after excluding '{EXCLUDED_OWNER_CANON}') rows: {len(duplicate_leads)}.")
-
-        # Non-zero users helper
+        # Helper for user counts
         def nonzero_users_count(df_: pd.DataFrame, group_cols: List[str]) -> pd.DataFrame:
-            d = df_[df_["Total_Amount"].fillna(0).ne(0)].dropna(subset=["email"]).copy()
-            if d.empty:
-                return pd.DataFrame(columns=group_cols + ["NonZero_Users"])
+            # Count if either 7d or Period is non-zero
+            mask = df_["Total_Amount"].fillna(0).ne(0) | df_["Period_Total_Amount"].fillna(0).ne(0)
+            d = df_[mask].dropna(subset=["email"]).copy()
+            if d.empty: return pd.DataFrame(columns=group_cols + ["NonZero_Users"])
             return d.groupby(group_cols, as_index=False)["email"].nunique().rename(columns={"email": "NonZero_Users"})
 
-        # Owner summary
-        owner_summary = summ_dedup.groupby(owner_col, as_index=False)[metric_cols].sum().sort_values("Net_Amount", ascending=False)
+        summ_cols = numeric_cols_7d + numeric_cols_period
+        
+        # Owner Summary
+        owner_summary = summ_dedup.groupby(owner_col, as_index=False)[summ_cols].sum().sort_values("Period_Net_Amount", ascending=False)
         owner_summary = owner_summary.merge(nonzero_users_count(summ_dedup, [owner_col]), on=owner_col, how="left").fillna({"NonZero_Users": 0})
 
-        # Connected summary
-        connected_summary = summ_dedup.groupby(["Connected"], as_index=False)[metric_cols].sum().sort_values("Net_Amount", ascending=False)
+        # Connected Summary
+        connected_summary = summ_dedup.groupby(["Connected"], as_index=False)[summ_cols].sum().sort_values("Period_Net_Amount", ascending=False)
         connected_summary = connected_summary.merge(nonzero_users_count(summ_dedup, ["Connected"]), on="Connected", how="left").fillna({"NonZero_Users": 0})
 
         # Owner x Connected
-        owner_x_connected = (
-            summ_dedup.groupby([owner_col, "Connected"], as_index=False)[metric_cols].sum().sort_values("Net_Amount", ascending=False)
-        )
+        owner_x_connected = summ_dedup.groupby([owner_col, "Connected"], as_index=False)[summ_cols].sum().sort_values("Period_Net_Amount", ascending=False)
         owner_x_connected = owner_x_connected.merge(nonzero_users_count(summ_dedup, [owner_col, "Connected"]), on=[owner_col, "Connected"], how="left").fillna({"NonZero_Users": 0})
 
-        # Label summary
-        labels_expanded = summ_dedup[["email", "labels_list"] + metric_cols].copy()
+        # Label Summary
+        labels_expanded = summ_dedup[["email", "labels_list"] + summ_cols].copy()
         labels_expanded = labels_expanded.explode("labels_list").rename(columns={"labels_list": "Label"})
         labels_expanded["Label"] = labels_expanded["Label"].fillna("").astype(str).str.strip()
         labels_expanded = labels_expanded[labels_expanded["Label"] != ""].copy()
-        labels_expanded["Connected_Label"] = labels_expanded["Label"].str.lower().apply(
-            lambda s: False if s.strip() == "not connected" else ("connected" in s)
-        )
-        label_summary = labels_expanded.groupby(["Label", "Connected_Label"], as_index=False)[metric_cols].sum().sort_values("Net_Amount", ascending=False)
+        labels_expanded["Connected_Label"] = labels_expanded["Label"].str.lower().apply(lambda s: False if s.strip() == "not connected" else ("connected" in s))
+        
+        label_summary = labels_expanded.groupby(["Label", "Connected_Label"], as_index=False)[summ_cols].sum().sort_values("Period_Net_Amount", ascending=False)
         label_counts = (
-            labels_expanded[labels_expanded["Total_Amount"].fillna(0).ne(0)]
+            labels_expanded[(labels_expanded["Total_Amount"].fillna(0).ne(0)) | (labels_expanded["Period_Total_Amount"].fillna(0).ne(0))]
             .dropna(subset=["email"])
-            .groupby(["Label", "Connected_Label"], as_index=False)["email"]
-            .nunique()
+            .groupby(["Label", "Connected_Label"], as_index=False)["email"].nunique()
             .rename(columns={"email": "NonZero_Users"})
         )
         label_summary = label_summary.merge(label_counts, on=["Label", "Connected_Label"], how="left").fillna({"NonZero_Users": 0})
 
-        # Time summary grouped by Lead created date (from deduped lead rows)
+        # Time Summary
         summ_dedup["Lead_Created_Date"] = pd.to_datetime(summ_dedup["_lead_created_dt"], errors="coerce").dt.date
-        time_summary = summ_dedup.groupby(["Lead_Created_Date"], as_index=False)[metric_cols].sum().sort_values("Lead_Created_Date")
+        time_summary = summ_dedup.groupby(["Lead_Created_Date"], as_index=False)[summ_cols].sum().sort_values("Lead_Created_Date")
         time_summary = time_summary.merge(nonzero_users_count(summ_dedup, ["Lead_Created_Date"]), on="Lead_Created_Date", how="left").fillna({"NonZero_Users": 0})
 
-        # =========================
-        # Self-converted logic (your updated requirement)
-        # 1) Subscription payer emails = New Payment Made events where Amount Description contains "Workspace Subscription"
-        # 2) Sales leads email list excludes Pipedrive owner
-        # 3) Self-converted = subscription_payers - sales_leads_emails
-        # =========================
-        sales_lead_emails = set(summ_base["email"].dropna().unique())
+        # Self Converted Detail Table (Need to run logic for detail view)
+        pay_sc = payments[payments["email"].isin(self_converted_emails)]
+        ref_sc = refunds[refunds["email"].isin(self_converted_emails)]
+        pay_sc_ce = payments_all_ce[payments_all_ce["email"].isin(self_converted_emails)]
+        ref_sc_ce = refunds_all_ce[refunds_all_ce["email"].isin(self_converted_emails)]
+        
+        sc_summ_7d = _windowed_email_summary(pay_sc, ref_sc, pay_sc_ce, ref_sc_ce, amount_col, desc_col, refund_amount_col, 7)
+        sc_summ_per = _strict_range_email_summary(pay_sc, ref_sc, pay_sc_ce, ref_sc_ce, amount_col, refund_amount_col)
+        self_converted_fact = sc_summ_7d.merge(sc_summ_per, on="email", how="left").sort_values("Period_Net_Amount", ascending=False)
 
-        sub_mask = payments_all["email"].notna()
-        if desc_col and desc_col in payments_all.columns:
-            sub_mask &= payments_all[desc_col].astype(str).str.contains("Workspace Subscription", case=False, na=False)
-        subscription_emails = set(payments_all.loc[sub_mask, "email"].dropna().unique())
-
-        self_converted_emails_list = sorted(list(subscription_emails - sales_lead_emails))
-        logs.append(f"Workspace Subscription payer emails: {len(subscription_emails)}.")
-        logs.append(f"Self-converted emails (subscription payers not in sales lead list): {len(self_converted_emails_list)}.")
-
-        # Compute self-converted revenue using same window rules
-        pay_sc = payments_all[payments_all["email"].isin(self_converted_emails_list)].copy()
-        ref_sc = refunds_all[refunds_all["email"].isin(self_converted_emails_list)].copy()
-        pay_sc_ce = payments_all_ce[payments_all_ce["email"].isin(self_converted_emails_list)].copy()
-        ref_sc_ce = refunds_all_ce[refunds_all_ce["email"].isin(self_converted_emails_list)].copy()
-
-        self_converted_fact = _windowed_email_summary(
-            payments_gross=pay_sc,
-            refunds_gross=ref_sc,
-            payments_ce=pay_sc_ce,
-            refunds_ce=ref_sc_ce,
-            amount_col=amount_col,
-            desc_col=desc_col,
-            refund_amount_col=refund_amount_col,
-            days=7,
-        ).sort_values("Net_Amount", ascending=False)
-
-        # Owner Summary extra block values
-        # Owner Summary extra block values (self-converted totals)
-        if not self_converted_fact.empty:
-            sc_total = float(pd.to_numeric(self_converted_fact.get("Total_Amount", 0), errors="coerce").fillna(0).sum())
-            sc_total_ce = float(pd.to_numeric(self_converted_fact.get("Total_Amount_creditExcluded", 0), errors="coerce").fillna(0).sum())
-            sc_ref = float(pd.to_numeric(self_converted_fact.get("Refund_Amount", 0), errors="coerce").fillna(0).sum())
-            sc_ref_ce = float(pd.to_numeric(self_converted_fact.get("Refund_Amount_creditExcluded", 0), errors="coerce").fillna(0).sum())
-            sc_net = float(pd.to_numeric(self_converted_fact.get("Net_Amount", 0), errors="coerce").fillna(0).sum())
-            sc_net_ce = float(pd.to_numeric(self_converted_fact.get("Net_Amount_creditExcluded", 0), errors="coerce").fillna(0).sum())
-            sc_txn = int(pd.to_numeric(self_converted_fact.get("Transactions", 0), errors="coerce").fillna(0).sum())
-            sc_txn_ce = int(pd.to_numeric(self_converted_fact.get("Transactions_creditExcluded", 0), errors="coerce").fillna(0).sum())
-            sc_users = int(self_converted_fact["email"].nunique()) if "email" in self_converted_fact.columns else int(len(self_converted_emails_list))
-        else:
-            sc_total = 0.0
-            sc_total_ce = 0.0
-            sc_ref = 0.0
-            sc_ref_ce = 0.0
-            sc_net = 0.0
-            sc_net_ce = 0.0
-            sc_txn = 0
-            sc_txn_ce = 0
-            sc_users = int(len(self_converted_emails_list))
-
-        # =========================
+        # ---------------------------
         # Charts
-        # =========================
-        # Owner chart
+        # ---------------------------
         fig_owner, ax_owner = plt.subplots(figsize=(10, 6))
         if not owner_summary.empty:
-            chart_df = owner_summary.set_index(owner_col)[["Net_Amount", "Net_Amount_creditExcluded"]]
+            chart_df = owner_summary.set_index(owner_col)[["Period_Net_Amount", "Net_Amount"]]
+            chart_df.columns = ["Strict Range Net", "7-Day Window Net"]
             chart_df.plot(kind="bar", ax=ax_owner)
-            for container in ax_owner.containers:
-                ax_owner.bar_label(container, labels=[str(int(round(v))) for v in container.datavalues], padding=2, fontsize=8)
-        ax_owner.set_title("Net Revenue by Owner (summaries exclude Pipedrive KrispCall)")
-        ax_owner.set_xlabel("Owner")
-        ax_owner.set_ylabel("Amount")
+        ax_owner.set_title("Net Revenue by Owner")
         plt.tight_layout()
 
-        # Owner x Connected chart (stacked net)
         fig_owner_conn, ax_owner_conn = plt.subplots(figsize=(10, 6))
         if not owner_x_connected.empty:
-            pivot = owner_x_connected.pivot_table(index=owner_col, columns="Connected", values="Net_Amount", aggfunc="sum").fillna(0.0)
-            pivot = pivot.rename(columns={False: "FALSE", True: "TRUE"})
-            cols = [c for c in ["FALSE", "TRUE"] if c in pivot.columns]
-            if cols:
-                pivot = pivot.loc[:, cols]
+            pivot = owner_x_connected.pivot_table(index=owner_col, columns="Connected", values="Period_Net_Amount", aggfunc="sum").fillna(0.0)
             pivot.plot(kind="bar", stacked=True, ax=ax_owner_conn)
-            for container in ax_owner_conn.containers:
-                ax_owner_conn.bar_label(container, labels=[str(int(round(v))) for v in container.datavalues], padding=2, fontsize=8)
-        ax_owner_conn.set_title("Net Revenue by Owner and Connected")
-        ax_owner_conn.set_xlabel("Owner")
-        ax_owner_conn.set_ylabel("Net Amount")
+        ax_owner_conn.set_title("Net Revenue (Strict Range) by Owner & Connected")
         plt.tight_layout()
 
-        # Time chart
         fig_time, ax_time = plt.subplots(figsize=(10, 5))
         if not time_summary.empty:
-            ax_time.plot(pd.to_datetime(time_summary["Lead_Created_Date"]), time_summary["Net_Amount"])
+            ax_time.plot(pd.to_datetime(time_summary["Lead_Created_Date"]), time_summary["Period_Net_Amount"], label="Strict Range")
+            ax_time.plot(pd.to_datetime(time_summary["Lead_Created_Date"]), time_summary["Net_Amount"], label="7-Day Window", linestyle="--")
+            ax_time.legend()
         ax_time.set_title("Net Amount by Lead Created Date")
-        ax_time.set_xlabel("Date")
-        ax_time.set_ylabel("Net Amount")
         plt.tight_layout()
 
-        # Prepare excel-friendly main tables
+        # Excel formatting preparation
         joined_export = joined.copy()
         joined_export["labels_list"] = joined_export["labels_list"].apply(lambda x: ", ".join(x) if isinstance(x, list) else "")
-
         joined_nonzero_export = joined_nonzero.copy()
         joined_nonzero_export["labels_list"] = joined_nonzero_export["labels_list"].apply(lambda x: ", ".join(x) if isinstance(x, list) else "")
 
-        # Owner summary with self-converted + sales attempt block inside the sheet
-        owner_for_excel = _add_totals_row(owner_summary, label_col=owner_col)
-
-        # Append a mini block rows as extra records (kept in the same sheet, below table)
-        owner_block = pd.DataFrame(
-            [
-                {
-                    owner_col: "Self Converted Revenue",
-                    "Net_Amount": sc_net,
-                    "Net_Amount_creditExcluded": sc_net_ce,
-                    "Total_Amount": sc_total,
-                    "Total_Amount_creditExcluded": sc_total_ce,
-                    "Refund_Amount": sc_ref,
-                    "Refund_Amount_creditExcluded": sc_ref_ce,
-                    "Transactions": sc_txn,
-                    "Transactions_creditExcluded": sc_txn_ce,
-                    "NonZero_Users": sc_users,
-                },
-                {
-                    owner_col: "Self Converted Number of Users",
-                    "NonZero_Users": sc_users,
-                },
-                {
-                    owner_col: "Overall Revenue (All Sources, Selected Range)",
-                    "Total_Amount": overall_revenue,
-                    "Total_Amount_creditExcluded": overall_revenue_ce,
-                    "Transactions": overall_transactions,
-                    "Transactions_creditExcluded": overall_transactions_ce,
-                },
-                {
-                    owner_col: "Overall Refunds (All Sources, Selected Range)",
-                    "Refund_Amount": overall_refunds,
-                    "Refund_Amount_creditExcluded": overall_refunds_ce,
-                },
-                {
-                    owner_col: "Number of Transactions (All Sources, Selected Range)",
-                    "Transactions": overall_transactions,
-                    "Transactions_creditExcluded": overall_transactions_ce,
-                },
-                {
-                    owner_col: "Sales Attempt Revenue (Summaries Total)",
-                    "Net_Amount": float(pd.to_numeric(owner_summary["Net_Amount"], errors="coerce").fillna(0).sum()),
-                    "Net_Amount_creditExcluded": float(pd.to_numeric(owner_summary["Net_Amount_creditExcluded"], errors="coerce").fillna(0).sum()),
-                    "Total_Amount": float(pd.to_numeric(owner_summary["Total_Amount"], errors="coerce").fillna(0).sum()) if "Total_Amount" in owner_summary.columns else "",
-                    "Total_Amount_creditExcluded": float(pd.to_numeric(owner_summary["Total_Amount_creditExcluded"], errors="coerce").fillna(0).sum()) if "Total_Amount_creditExcluded" in owner_summary.columns else "",
-                    "Refund_Amount": float(pd.to_numeric(owner_summary["Refund_Amount"], errors="coerce").fillna(0).sum()) if "Refund_Amount" in owner_summary.columns else "",
-                    "Refund_Amount_creditExcluded": float(pd.to_numeric(owner_summary["Refund_Amount_creditExcluded"], errors="coerce").fillna(0).sum()) if "Refund_Amount_creditExcluded" in owner_summary.columns else "",
-                    "Transactions": int(pd.to_numeric(owner_summary.get("Transactions", 0), errors="coerce").fillna(0).sum()),
-                    "Transactions_creditExcluded": int(pd.to_numeric(owner_summary.get("Transactions_creditExcluded", 0), errors="coerce").fillna(0).sum()),
-                    "NonZero_Users": int(pd.to_numeric(owner_summary.get("NonZero_Users", 0), errors="coerce").fillna(0).sum()) if "NonZero_Users" in owner_summary.columns else "",
-                },
-            ]
-        )
-        # Ensure all columns exist
-        for c in owner_for_excel.columns:
-            if c not in owner_block.columns:
-                owner_block[c] = ""
-        owner_for_excel = pd.concat([owner_for_excel, pd.DataFrame([{c: "" for c in owner_for_excel.columns}]), owner_block[owner_for_excel.columns]], ignore_index=True)
-
-        # Logs df
         logs_df = pd.DataFrame({"log": logs})
 
-        # Excel build
         excel_name, excel_bytes = _build_excel(
             leads_with_payments=joined_export,
             leads_nonzero=joined_nonzero_export,
-            email_summary=email_summary,
-            owner_summary=owner_for_excel,
+            email_summary=joined, # Dump full joined to email summary
+            owner_summary=owner_summary,
             owner_x_connected=owner_x_connected,
             connected_summary=connected_summary,
             label_summary=label_summary,
             time_summary=time_summary,
             duplicate_leads=duplicate_leads,
             self_converted_emails=self_converted_fact,
+            overall_metrics_df=overall_metrics_df,
             logs_df=logs_df,
             fig_owner=fig_owner,
             fig_owner_conn=fig_owner_conn,
@@ -1029,56 +902,51 @@ def main():
         )
 
     # =========================
-    # UI tabs
+    # UI TABS
     # =========================
-    tab_overview, tab_tables, tab_summaries, tab_time, tab_export, tab_logs = st.tabs(
-        ["Overview", "Main Tables", "Summaries", "Time", "Export", "Logs"]
+    tab_overall, tab_overview, tab_tables, tab_summaries, tab_time, tab_export, tab_logs = st.tabs(
+        ["Overall Metrics", "Overview", "Main Tables", "Summaries", "Time", "Export", "Logs"]
     )
 
+    with tab_overall:
+        st.markdown("### Overall Business Metrics (Selected Date Range)")
+        st.dataframe(overall_metrics_df, use_container_width=True)
+        
+        st.markdown("---")
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Overall Revenue (Period)", f"{metric_overall_revenue:,.2f}")
+        c2.metric("Sales Attempted Revenue (Period)", f"{sa_period_net:,.2f}")
+        c3.metric("Self Converted Revenue (Period)", f"{sc_period_net:,.2f}")
+        
     with tab_overview:
-        # Summary totals come from owner_summary total (dedup + excluded)
-        total_net = float(pd.to_numeric(owner_summary["Net_Amount"], errors="coerce").fillna(0).sum()) if not owner_summary.empty else 0.0
-        total_net_ce = float(pd.to_numeric(owner_summary["Net_Amount_creditExcluded"], errors="coerce").fillna(0).sum()) if not owner_summary.empty else 0.0
+        total_net_period = float(pd.to_numeric(owner_summary["Period_Net_Amount"], errors="coerce").fillna(0).sum()) if not owner_summary.empty else 0.0
+        total_net_7d = float(pd.to_numeric(owner_summary["Net_Amount"], errors="coerce").fillna(0).sum()) if not owner_summary.empty else 0.0
 
-        c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Net Revenue (summaries)", f"{total_net:,.2f}")
-        c2.metric("Net Revenue creditExcluded", f"{total_net_ce:,.2f}")
-        c3.metric("Self-Converted Contacts", f"{len(self_converted_emails_list):,}")
-        c4.metric("Self-Converted Net", f"{sc_net:,.2f}")
-
+        c1, c2, c3 = st.columns(3)
+        c1.metric("Sum of Owners (Period Net)", f"{total_net_period:,.2f}", help="Sum of Period Net for all owners (excl. Pipedrive KC)")
+        c2.metric("Sum of Owners (7-Day Net)", f"{total_net_7d:,.2f}", help="Sum of 7-Day Window Net for all owners (excl. Pipedrive KC)")
+        c3.metric("Self-Converted Users", f"{len(self_converted_emails):,}")
+        
         st.pyplot(fig_owner, use_container_width=True)
 
     with tab_tables:
-        st.markdown("#### Leads with payments (includes all owners, including Pipedrive KrispCall)")
+        st.markdown("#### Leads with payments")
         st.dataframe(joined_export, use_container_width=True)
         st.markdown("#### Leads with non-zero payments only")
         st.dataframe(joined_nonzero_export, use_container_width=True)
 
     with tab_summaries:
-        st.markdown("#### Owner Summary (Pipedrive KrispCall excluded)")
-        st.dataframe(_style_totals_row(_add_totals_row(owner_summary, label_col=owner_summary.columns[0] if not owner_summary.empty else None)), use_container_width=True)
-        st.markdown("#### Owner x Connected (Pipedrive KrispCall excluded)")
-        st.dataframe(_style_totals_row(_add_totals_row(owner_x_connected, label_col=owner_x_connected.columns[0] if not owner_x_connected.empty else None)), use_container_width=True)
-        st.pyplot(fig_owner_conn, use_container_width=True)
-
+        st.markdown("#### Owner Summary")
+        st.dataframe(_style_totals_row(_add_totals_row(owner_summary, label_col=owner_col)), use_container_width=True)
+        
         st.markdown("#### Connected Summary")
-        st.dataframe(_style_totals_row(_add_totals_row(connected_summary, label_col=connected_summary.columns[0] if not connected_summary.empty else None)), use_container_width=True)
+        st.dataframe(_style_totals_row(_add_totals_row(connected_summary, label_col="Connected")), use_container_width=True)
 
-        st.markdown("#### Label Summary")
-        st.dataframe(_style_totals_row(_add_totals_row(label_summary, label_col=label_summary.columns[0] if not label_summary.empty else None)), use_container_width=True)
-
-        st.markdown("#### Self-Converted Emails and Revenue")
+        st.markdown("#### Self-Converted Detail")
         st.dataframe(self_converted_fact, use_container_width=True)
 
-        st.markdown("#### Duplicate Leads by Email (after excluding Pipedrive KrispCall)")
-        if duplicate_leads.empty:
-            st.write("No duplicate emails detected in summaries base.")
-        else:
-            st.dataframe(duplicate_leads, use_container_width=True)
-
     with tab_time:
-        st.markdown("#### Time Summary (grouped by Lead - Lead created on date)")
-        st.dataframe(_style_totals_row(_add_totals_row(time_summary, label_col=time_summary.columns[0] if not time_summary.empty else None)), use_container_width=True)
+        st.dataframe(_style_totals_row(_add_totals_row(time_summary, label_col="Lead_Created_Date")), use_container_width=True)
         st.pyplot(fig_time, use_container_width=True)
 
     with tab_export:
@@ -1091,8 +959,7 @@ def main():
 
     with tab_logs:
         if logs:
-            for line in logs:
-                st.info(line)
+            for line in logs: st.info(line)
         else:
             st.write("No issues logged.")
 
