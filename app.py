@@ -338,7 +338,7 @@ def _windowed_email_summary(
 
         # Prefer "Workspace Subscription" as trigger if present
         if desc_col and desc_col in g.columns:
-            mask = g[desc_col].astype(str).str.contains("Workspace Subscription", case=False, na=False)
+            mask = g[desc_col].astype(str).str.contains(r"Starter,|Advance,|Workspace Subscription", case=False, na=False, regex=True)
             if mask.any():
                 trigger = True
                 start = g.loc[mask, "_dt"].min()
@@ -848,7 +848,7 @@ def main():
 
         sub_mask = pd.Series(False, index=payments.index)
         if desc_col and desc_col in payments.columns:
-            sub_mask = payments[desc_col].astype(str).str.contains("workspace subscription", case=False, na=False)
+            sub_mask = payments[desc_col].astype(str).str.contains(r"Starter,|Advance,|Workspace Subscription", case=False, na=False, regex=True)
 
         overall_conversion_emails = set(
             payments.loc[sub_mask, "email"].dropna().astype(str).str.strip().str.lower().unique()
