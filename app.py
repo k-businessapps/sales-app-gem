@@ -386,8 +386,9 @@ def _windowed_email_summary(
                 "email": email,
                 # These names are preserved for downstream compatibility.
                 # In this Zoho app, Refund_Amount fields are period-applied when refund_scope="period".
-                "Net_Amount": gross_total - ref_total,
-                "Net_Amount_creditExcluded": ce_total - ref_ce_total,
+                # Net is floored at 0: if refunds exceed revenue for a user, net penalty is capped at 0.
+                "Net_Amount": max(0.0, gross_total - ref_total),
+                "Net_Amount_creditExcluded": max(0.0, ce_total - ref_ce_total),
                 "Total_Amount": gross_total,  # 7-day payment window total
                 "Total_Amount_creditExcluded": ce_total,  # 7-day payment window total (credit-excluded)
                 "Refund_Amount": ref_total,  # full period refund for email (requested behavior)
@@ -426,8 +427,9 @@ def _strict_range_email_summary(
     df.index.name = "email"
     df = df.reset_index()
 
-    df["Period_Net_Amount"] = df["Period_Total_Amount"] - df["Period_Refund_Amount"]
-    df["Period_Net_Amount_creditExcluded"] = df["Period_Total_Amount_creditExcluded"] - df["Period_Refund_Amount_creditExcluded"]
+    # Floor at 0: if refunds exceed revenue for a user, net penalty is capped at 0.
+    df["Period_Net_Amount"] = (df["Period_Total_Amount"] - df["Period_Refund_Amount"]).clip(lower=0)
+    df["Period_Net_Amount_creditExcluded"] = (df["Period_Total_Amount_creditExcluded"] - df["Period_Refund_Amount_creditExcluded"]).clip(lower=0)
 
     return df
 
@@ -842,9 +844,8 @@ def main():
         # -------------------------
         # Overall Revenue / Conversion
         # -------------------------
-        overall_rev_sum = float(payments[amount_col].sum()) if not payments.empty else 0.0
-        overall_ref_sum = float(refunds[refund_amount_col].sum()) if not refunds.empty else 0.0
-        metric_overall_revenue = float(overall_rev_sum - overall_ref_sum)
+        # Sum per-user clamped period nets so no individual user can produce a negative contribution.
+        metric_overall_revenue = float(email_summary_period["Period_Net_Amount"].sum()) if not email_summary_period.empty else 0.0
 
         sub_mask = pd.Series(False, index=payments.index)
         if desc_col and desc_col in payments.columns:
@@ -914,10 +915,12 @@ def main():
 
             p_pay = payments[payments["email"].isin(emails_list)]
             p_ref = refunds[refunds["email"].isin(emails_list)]
-            period_net = float(p_pay[amount_col].sum() - p_ref[refund_amount_col].sum())
-
             p_pay_ce = payments_all_ce[payments_all_ce["email"].isin(emails_list)]
             p_ref_ce = refunds_all_ce[refunds_all_ce["email"].isin(emails_list)]
+
+            # Sum per-user clamped nets so no user can drag the aggregate negative.
+            _per_user = _strict_range_email_summary(p_pay, p_ref, p_pay_ce, p_ref_ce, amount_col, refund_amount_col)
+            period_net = float(_per_user["Period_Net_Amount"].sum()) if not _per_user.empty else 0.0
 
             summ = _windowed_email_summary(
                 payments_gross=p_pay,
@@ -1227,9 +1230,9 @@ def main():
 
     with tab_tables:
         st.markdown("#### Zoho Leads joined with payment summaries")
-        st.dataframe(joined_export, use_container_width=True)
+        st.dataframe(_style_totals_row(_add_totals_row(joined_export)), use_container_width=True)
         st.markdown("#### Rows with non-zero payments only")
-        st.dataframe(joined_nonzero_export, use_container_width=True)
+        st.dataframe(_style_totals_row(_add_totals_row(joined_nonzero_export)), use_container_width=True)
 
     with tab_summaries:
         st.markdown("#### Owner Summary")
@@ -1242,7 +1245,7 @@ def main():
         st.dataframe(_style_totals_row(_add_totals_row(lead_status_summary, label_col="Lead_Status")), use_container_width=True)
 
         st.markdown("#### Self-Converted Detail")
-        st.dataframe(self_converted_fact, use_container_width=True)
+        st.dataframe(_style_totals_row(_add_totals_row(self_converted_fact, label_col="email")), use_container_width=True)
 
     with tab_time:
         st.dataframe(_style_totals_row(_add_totals_row(time_summary, label_col="Lead_Created_Date")), use_container_width=True)
@@ -1259,7 +1262,7 @@ def main():
         st.dataframe(audit_counts_df, use_container_width=True)
 
         st.markdown("### Owner Distribution for Conversion Emails (Deduped First Lead Owner)")
-        st.dataframe(owner_dist_df, use_container_width=True)
+        st.dataframe(_style_totals_row(_add_totals_row(owner_dist_df, label_col="first_lead_owner_dedup")), use_container_width=True)
 
         st.markdown("### Conversion Email Classification (Full)")
         st.download_button(
