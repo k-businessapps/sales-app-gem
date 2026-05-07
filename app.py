@@ -524,7 +524,7 @@ def _build_excel(
     add_sheet("Leads_with_Payments", leads_with_payments, label_col=None)
     add_sheet("Leads_Payments_NonZero", leads_nonzero, label_col=None)
     add_sheet("Joined_Email_Level", joined_email_level_table, label_col="email" if "email" in joined_email_level_table.columns else None)
-    add_sheet("Owner_Summary", owner_summary, label_col=owner_summary.columns[0] if not owner_summary.empty else None, add_totals=False)
+    add_sheet("Owner_Summary", owner_summary, label_col=owner_summary.columns[0] if not owner_summary.empty else None)
     add_sheet("Owner_x_Connected", owner_x_connected, label_col=owner_x_connected.columns[0] if not owner_x_connected.empty else None)
     add_sheet("Connected_Summary", connected_summary, label_col="Connected" if "Connected" in connected_summary.columns else None)
     add_sheet("LeadStatus_Summary", lead_status_summary, label_col="Lead_Status" if "Lead_Status" in lead_status_summary.columns else None)
