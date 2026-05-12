@@ -412,26 +412,73 @@ def _strict_range_email_summary(
 ) -> pd.DataFrame:
     """
     Strict selected range summation (Period Revenue) per email.
+
+    Safe behavior:
+    - Works when payments are empty.
+    - Works when refunds are empty.
+    - Works when credit-excluded payments/refunds are empty.
+    - Always returns the expected output columns.
     """
-    def get_sums(df, group_col, sum_col, out_col):
-        if df.empty:
-            return pd.Series(dtype=float)
-        return df.groupby(group_col)[sum_col].sum().rename(out_col)
+    expected_cols = [
+        "email",
+        "Period_Total_Amount",
+        "Period_Total_Amount_creditExcluded",
+        "Period_Refund_Amount",
+        "Period_Refund_Amount_creditExcluded",
+        "Period_Net_Amount",
+        "Period_Net_Amount_creditExcluded",
+    ]
+
+    numeric_cols = [
+        "Period_Total_Amount",
+        "Period_Total_Amount_creditExcluded",
+        "Period_Refund_Amount",
+        "Period_Refund_Amount_creditExcluded",
+    ]
+
+    def get_sums(df: pd.DataFrame, group_col: str, sum_col: str, out_col: str) -> pd.Series:
+        if df is None or df.empty:
+            return pd.Series(dtype="float64", name=out_col)
+        if group_col not in df.columns or sum_col not in df.columns:
+            return pd.Series(dtype="float64", name=out_col)
+
+        temp = df.copy()
+        temp[group_col] = temp[group_col].astype(str).str.strip().str.lower()
+        temp = temp[temp[group_col].ne("") & temp[group_col].ne("none") & temp[group_col].ne("nan")].copy()
+        if temp.empty:
+            return pd.Series(dtype="float64", name=out_col)
+
+        temp[sum_col] = pd.to_numeric(temp[sum_col], errors="coerce").fillna(0.0)
+        return temp.groupby(group_col)[sum_col].sum().rename(out_col)
 
     p_gross = get_sums(payments_gross, "email", amount_col, "Period_Total_Amount")
     p_ce = get_sums(payments_ce, "email", amount_col, "Period_Total_Amount_creditExcluded")
     r_gross = get_sums(refunds_gross, "email", refund_amount_col, "Period_Refund_Amount")
     r_ce = get_sums(refunds_ce, "email", refund_amount_col, "Period_Refund_Amount_creditExcluded")
 
-    df = pd.concat([p_gross, p_ce, r_gross, r_ce], axis=1).fillna(0.0)
+    df = pd.concat([p_gross, p_ce, r_gross, r_ce], axis=1)
+
+    if df.empty:
+        return pd.DataFrame(columns=expected_cols)
+
     df.index.name = "email"
     df = df.reset_index()
 
-    # Floor at 0: if refunds exceed revenue for a user, net penalty is capped at 0.
-    df["Period_Net_Amount"] = (df["Period_Total_Amount"] - df["Period_Refund_Amount"]).clip(lower=0)
-    df["Period_Net_Amount_creditExcluded"] = (df["Period_Total_Amount_creditExcluded"] - df["Period_Refund_Amount_creditExcluded"]).clip(lower=0)
+    for col in numeric_cols:
+        if col not in df.columns:
+            df[col] = 0.0
+        df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
 
-    return df
+    # Floor at 0: if refunds exceed revenue for a user, net penalty is capped at 0.
+    df["Period_Net_Amount"] = (
+        df["Period_Total_Amount"] - df["Period_Refund_Amount"]
+    ).clip(lower=0)
+
+    df["Period_Net_Amount_creditExcluded"] = (
+        df["Period_Total_Amount_creditExcluded"] - df["Period_Refund_Amount_creditExcluded"]
+    ).clip(lower=0)
+
+    return df[expected_cols]
 
 
 def _add_totals_row(df: pd.DataFrame, label_col: Optional[str] = None) -> pd.DataFrame:
@@ -920,7 +967,11 @@ def main():
 
             # Sum per-user clamped nets so no user can drag the aggregate negative.
             _per_user = _strict_range_email_summary(p_pay, p_ref, p_pay_ce, p_ref_ce, amount_col, refund_amount_col)
-            period_net = float(_per_user["Period_Net_Amount"].sum()) if not _per_user.empty else 0.0
+            period_net = (
+                float(_per_user["Period_Net_Amount"].sum())
+                if not _per_user.empty and "Period_Net_Amount" in _per_user.columns
+                else 0.0
+            )
 
             summ = _windowed_email_summary(
                 payments_gross=p_pay,
