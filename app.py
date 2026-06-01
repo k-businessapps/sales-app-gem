@@ -338,7 +338,7 @@ def _windowed_email_summary(
 
         # Prefer "Workspace Subscription" as trigger if present
         if desc_col and desc_col in g.columns:
-            mask = g[desc_col].astype(str).str.contains(r"Starter,|Advance,|Workspace Subscription", case=False, na=False, regex=True)
+            mask = g[desc_col].astype(str).str.contains(r"Starter|Advance|Workspace Subscription", case=False, na=False, regex=True)
             if mask.any():
                 trigger = True
                 start = g.loc[mask, "_dt"].min()
